@@ -1,0 +1,5 @@
+.env
+exports/
+sample-export/
+__pycache__/
+*.py[cod]

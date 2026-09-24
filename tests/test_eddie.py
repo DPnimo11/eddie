@@ -72,5 +72,35 @@ class ExportTests(unittest.TestCase):
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 
+class ThreadAssetTests(unittest.TestCase):
+    CONTENT = """<document version="2.0">
+      <paragraph>September 22, 2026 - CSP wrap-up and intro to Logical Agents ·
+        <link href="https://docs.google.com/presentation/d/slide_123/edit">CSP slides</link> ·
+        <link href="https://docs.google.com/document/d/note_456/edit?usp=sharing">CSP notes</link> ·
+        <link href="https://upenn.hosted.panopto.com/Panopto/Pages/Viewer.aspx?id=video">Recording</link>
+      </paragraph>
+    </document>"""
+
+    def test_extracts_docs_and_slides_but_not_recordings(self):
+        assets = eddie.extract_thread_assets(self.CONTENT)
+        self.assertEqual([asset.kind for asset in assets], ["slides", "notes"])
+        self.assertEqual(assets[0].date, "2026-09-22")
+        self.assertIn("csp-slides", assets[0].filename)
+        self.assertTrue(assets[0].export_url.endswith("/export/pdf"))
+        self.assertTrue(assets[1].export_url.endswith("/export?format=pdf"))
+
+    def test_rejects_non_google_and_non_https_links(self):
+        self.assertIsNone(eddie.google_pdf_url("https://example.com/document/d/123/edit"))
+        self.assertIsNone(eddie.google_pdf_url("http://docs.google.com/document/d/123/edit"))
+
+    def test_repeated_file_is_deduplicated(self):
+        repeated = self.CONTENT.replace(
+            "</paragraph>",
+            '<link href="https://docs.google.com/presentation/d/slide_123/edit?copy=1">Slides again</link></paragraph>',
+        )
+        assets = eddie.extract_thread_assets(repeated)
+        self.assertEqual([asset.kind for asset in assets], ["slides", "notes"])
+
+
 if __name__ == "__main__":
     unittest.main()

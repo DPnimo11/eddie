@@ -4,19 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import random
 import re
 import sys
 import time
+import unicodedata
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -204,6 +207,17 @@ class Term:
     sessions: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ThreadAsset:
+    kind: str
+    label: str
+    lecture: str
+    date: str
+    source_url: str
+    export_url: str
+    filename: str
+
+
 def parse_term(value: str | None) -> Term | None:
     if not value:
         return None
@@ -317,6 +331,132 @@ def export_thread(thread: dict[str, Any], course_id: int) -> dict[str, Any]:
     }
 
 
+def extract_thread_assets(content: str) -> list[ThreadAsset]:
+    """Find Google Docs/Slides links in Ed's XML content; ignore recordings."""
+    if not content.strip():
+        return []
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as error:
+        raise EddieError(f"The Ed thread's rich content could not be parsed: {error}") from None
+
+    parent = {child: node for node in root.iter() for child in node}
+    assets: list[ThreadAsset] = []
+    seen_exports: set[str] = set()
+    used_names: dict[str, int] = {}
+    for node in root.iter():
+        source_url = html.unescape(node.attrib.get("href") or node.attrib.get("url") or "")
+        google = google_pdf_url(source_url)
+        if not google:
+            continue
+        kind, export_url = google
+        if export_url in seen_exports:
+            continue
+        seen_exports.add(export_url)
+        label = _collapse_text("".join(node.itertext())) or kind
+        row = node
+        while row in parent and _local_tag(row.tag) not in {"paragraph", "list-item"}:
+            row = parent[row]
+        row_text = _collapse_text("".join(row.itertext()))
+        date, lecture = _lecture_metadata(row_text)
+        stem_parts = [date, lecture, label]
+        stem = "-".join(_slug(part) for part in stem_parts if part)
+        if not stem:
+            stem = f"thread-file-{len(assets) + 1:02d}-{kind}"
+        stem = stem[:180].rstrip("-_")
+        occurrence = used_names.get(stem, 0) + 1
+        used_names[stem] = occurrence
+        filename = f"{stem}{f'-{occurrence}' if occurrence > 1 else ''}.pdf"
+        assets.append(
+            ThreadAsset(
+                kind=kind,
+                label=label,
+                lecture=lecture,
+                date=date,
+                source_url=source_url,
+                export_url=export_url,
+                filename=filename,
+            )
+        )
+    return assets
+
+
+def google_pdf_url(value: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or parsed.hostname != "docs.google.com":
+        return None
+    match = re.match(r"^/(presentation|document)/d/([A-Za-z0-9_-]+)(?:/|$)", parsed.path)
+    if not match:
+        return None
+    google_type, file_id = match.groups()
+    if google_type == "presentation":
+        return "slides", f"https://docs.google.com/presentation/d/{file_id}/export/pdf"
+    return "notes", f"https://docs.google.com/document/d/{file_id}/export?format=pdf"
+
+
+def _local_tag(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _collapse_text(value: str) -> str:
+    return " ".join(value.replace("\xa0", " ").split())
+
+
+def _lecture_metadata(row_text: str) -> tuple[str, str]:
+    match = re.match(
+        r"^(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+        r"(\d{1,2}),\s*(\d{4})\s*[-–—]\s*(.*?)(?:\s*(?:·|Â·)\s*|$)",
+        row_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return "", ""
+    month, day, year, lecture = match.groups()
+    parsed = datetime.strptime(f"{month} {day} {year}", "%B %d %Y")
+    return parsed.strftime("%Y-%m-%d"), lecture.strip()
+
+
+def _slug(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
+
+
+def download_pdf(asset: ThreadAsset, destination: Path, force: bool = False) -> str:
+    if destination.exists() and not force:
+        return "skipped"
+    request = Request(
+        asset.export_url,
+        headers={"Accept": "application/pdf", "User-Agent": "eddie-edstem-exporter/0.1"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            data = response.read()
+            content_type = response.headers.get("Content-Type", "").lower()
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            raise EddieError(
+                f"Google requires a signed-in account for {asset.filename}; use an authenticated Drive connection."
+            ) from None
+        raise EddieError(f"Google rejected {asset.filename} (HTTP {error.code}).") from None
+    except (URLError, TimeoutError) as error:
+        reason = getattr(error, "reason", error)
+        raise EddieError(f"Could not download {asset.filename}: {reason}") from None
+    if not data.startswith(b"%PDF-"):
+        detail = f"content type {content_type or 'unknown'}"
+        raise EddieError(
+            f"Google did not return a PDF for {asset.filename} ({detail}); the file may require a signed-in browser."
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    temporary.write_bytes(data)
+    temporary.replace(destination)
+    return "downloaded"
+
+
 def safe_filename(course: dict[str, Any]) -> str:
     stem = "-".join(
         part for part in [_norm(course.get("code")), _norm(course.get("session")), _norm(course.get("year"))] if part
@@ -386,6 +526,38 @@ def run_export(client: EdClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def run_download_thread_files(client: EdClient, args: argparse.Namespace) -> int:
+    thread = client.thread(args.thread_id)
+    assets = extract_thread_assets(str(thread.get("content") or ""))
+    if args.kind:
+        allowed = set(args.kind)
+        assets = [asset for asset in assets if asset.kind in allowed]
+    if not assets:
+        raise EddieError("No matching Google Slides or Google Docs links were found in that thread.")
+
+    output_dir = Path(args.output_dir)
+    print(
+        f"Found {len(assets)} PDF asset(s) in thread #{_int(thread.get('number'))}: "
+        f"{thread.get('title') or ''}"
+    )
+    if args.dry_run:
+        for asset in assets:
+            print(f"[{asset.kind}] {asset.filename}")
+        return 0
+
+    downloaded = 0
+    skipped = 0
+    for asset in assets:
+        status = download_pdf(asset, output_dir / asset.filename, force=args.force)
+        if status == "downloaded":
+            downloaded += 1
+        else:
+            skipped += 1
+        print(f"{status}: {asset.filename}")
+    print(f"Done: {downloaded} downloaded, {skipped} already present; recordings ignored.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="eddie",
@@ -406,6 +578,22 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--limit", type=int, help="maximum thread-list entries per course (useful for testing)")
     export_parser.add_argument("--all-types", action="store_true", help="include posts and announcements, not just questions")
     export_parser.set_defaults(handler=run_export)
+
+    files_parser = subparsers.add_parser(
+        "download-thread-files",
+        help="download Google Slides and Docs linked from a thread as PDFs (recordings are ignored)",
+    )
+    files_parser.add_argument("--thread-id", required=True, type=int, help="numeric Ed thread ID")
+    files_parser.add_argument("--output-dir", required=True, help="destination directory")
+    files_parser.add_argument(
+        "--kind",
+        action="append",
+        choices=("slides", "notes"),
+        help="download only this kind; repeatable (default: both)",
+    )
+    files_parser.add_argument("--dry-run", action="store_true", help="show planned filenames without downloading")
+    files_parser.add_argument("--force", action="store_true", help="replace files that already exist")
+    files_parser.set_defaults(handler=run_download_thread_files)
     return parser
 
 

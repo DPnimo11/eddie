@@ -36,6 +36,18 @@ python .\eddie.py export --course CIS3200 --term fa26 --limit 3 --output-dir sam
 
 Use `--course-id 12345` if a code matches more than one enrollment. Run `python .\eddie.py export --help` for all options.
 
+## Download slides and notes from a thread
+
+Eddie can convert Google Slides and Google Docs linked in an Ed thread to local PDFs. It intentionally ignores recording links:
+
+```powershell
+python .\eddie.py download-thread-files --thread-id 8210743 --output-dir "C:\Users\you\Documents\course\notes"
+```
+
+Add `--dry-run` to preview filenames, `--kind slides` or `--kind notes` to select one type, and `--force` to replace existing files. Existing files are otherwise skipped.
+
+Repeated links are downloaded only once. Direct CLI downloads work for link-accessible files; domain-restricted Google files require an authenticated Google Drive connection.
+
 ## JSON shape
 
 Each course file contains course metadata and a `threads` array. A thread includes its title/body, category, status flags, `answers`, top-level `comments`, and recursively nested comments. Both Ed's `content` and rich `document` representations are retained so a later search or AI layer can choose the appropriate input.
